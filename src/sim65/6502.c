@@ -52,6 +52,7 @@
 #include "trace.h"
 
 #include "6502.h"
+#include "main.h"
 
 /*
 
@@ -4782,6 +4783,11 @@ unsigned ExecuteInsn (void)
 
         /* Increment the instruction counter by one. */
         Peripherals.Counter.CpuInstructions += 1;
+
+        /* Check for block I/O hook at $C20A */
+        if (Regs.PC == 0xC20A) {
+            HandleBlockIO ();
+        }
 
         /* Execute the instruction. The handler sets the 'Cycles' variable. */
         Handlers[CPU][OPC] ();

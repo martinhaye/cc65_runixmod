@@ -63,6 +63,13 @@
 /* Name of program file */
 const char* ProgramFile;
 
+/* Name of disk image file (.2mg format) */
+static const char* DiskImageFile = NULL;
+
+/* Disk image data (loaded from .2mg) */
+static unsigned char* DiskImage = NULL;
+static unsigned int DiskBlockCount = 0;
+
 /* Set to True if CPU mode override is in effect. If set, the CPU is not read from the program file. */
 static bool CPUOverrideActive = false;
 
@@ -94,6 +101,7 @@ static void Usage (void)
             "Short options:\n"
             "  -h\t\t\tHelp (this text)\n"
             "  -c\t\t\tPrint amount of executed CPU cycles\n"
+            "  -d <file>\t\tLoad .2mg disk image\n"
             "  -v\t\t\tIncrease verbosity\n"
             "  -V\t\t\tPrint the simulator version number\n"
             "  -x <num>\t\tExit simulator after <num> cycles\n"
@@ -102,6 +110,7 @@ static void Usage (void)
             "  --help\t\tHelp (this text)\n"
             "  --cycles\t\tPrint amount of executed CPU cycles\n"
             "  --cpu <type>\t\tOverride CPU type (6502, 65C02, 6502X)\n"
+            "  --disk <file>\t\tLoad .2mg disk image\n"
             "  --trace\t\tEnable CPU trace\n"
             "  --verbose\t\tIncrease verbosity\n"
             "  --version\t\tPrint the simulator version number\n",
@@ -182,6 +191,151 @@ static void OptQuitXIns (const char* Opt attribute ((unused)),
 /* Quit after MaxCycles cycles */
 {
     MaxCycles = strtoull(Arg, NULL, 0);
+}
+
+
+
+static void OptDisk (const char* Opt attribute ((unused)),
+                     const char* Arg)
+/* Set disk image file */
+{
+    DiskImageFile = Arg;
+}
+
+
+
+static void LoadDiskImage (void)
+/* Load .2mg disk image into memory */
+{
+    FILE* F;
+    unsigned char header[64];
+    unsigned long diskSize;
+    size_t bytesRead;
+
+    if (DiskImageFile == NULL) {
+        return; /* No disk image specified */
+    }
+
+    /* Open the disk image file */
+    F = fopen(DiskImageFile, "rb");
+    if (F == NULL) {
+        Error("Cannot open disk image '%s': %s", DiskImageFile, strerror(errno));
+    }
+
+    /* Read and validate .2mg header */
+    if (fread(header, 1, 64, F) != 64) {
+        Error("'%s': Cannot read .2mg header", DiskImageFile);
+    }
+
+    /* Check magic signature "2IMG" */
+    if (header[0] != '2' || header[1] != 'I' || header[2] != 'M' || header[3] != 'G') {
+        Error("'%s': Invalid .2mg signature", DiskImageFile);
+    }
+
+    /* Get disk size from header (bytes 28-31, little-endian) */
+    diskSize = header[28] | (header[29] << 8) | (header[30] << 16) | (header[31] << 24);
+    DiskBlockCount = diskSize / 512;
+
+    Print(stderr, 1, "Loading disk image '%s' (%u blocks)\n", DiskImageFile, DiskBlockCount);
+
+    /* Allocate memory for disk image */
+    DiskImage = malloc(diskSize);
+    if (DiskImage == NULL) {
+        Error("Cannot allocate memory for disk image (%lu bytes)", diskSize);
+    }
+
+    /* Read disk data (header is already skipped, data starts at offset 64) */
+    bytesRead = fread(DiskImage, 1, diskSize, F);
+    if (bytesRead != diskSize) {
+        Error("'%s': Failed to read disk data (expected %lu bytes, got %lu)",
+              DiskImageFile, diskSize, (unsigned long)bytesRead);
+    }
+
+    fclose(F);
+}
+
+
+
+static void InstallDiskROM (void)
+/* Install ProDOS block device ROM at $C200-$C2FF */
+{
+    unsigned int addr;
+
+    if (DiskImageFile == NULL) {
+        return; /* No disk image, no ROM needed */
+    }
+
+    /* Clear ROM area */
+    for (addr = 0xC200; addr <= 0xC2FF; addr++) {
+        MemWriteByte(addr, 0x60); /* RTS opcode */
+    }
+
+    /* ProDOS signature bytes for slot 2 */
+    MemWriteByte(0xC201, 0x20); /* ID byte 1 */
+    MemWriteByte(0xC203, 0x00); /* ID byte 2 */
+    MemWriteByte(0xC205, 0x03); /* ID byte 3 */
+
+    /* Block device entry point offset at $C2FF */
+    MemWriteByte(0xC2FF, 0x0A); /* Points to $C20A */
+
+    /* Entry point at $C20A - just RTS, actual I/O done by hook */
+    MemWriteByte(0xC20A, 0x60); /* RTS */
+
+    Print(stderr, 1, "Installed ProDOS block device ROM at $C200 (device $20)\n");
+}
+
+
+
+void HandleBlockIO (void)
+/* Handle ProDOS block I/O request - called when PC = $C20A */
+{
+    unsigned char command;
+    unsigned int bufferAddr;
+    unsigned int blockNum;
+    unsigned int blockOffset;
+    unsigned int i;
+
+    if (DiskImage == NULL) {
+        return; /* No disk image loaded */
+    }
+
+    /* Read ProDOS block device parameters from zero page $42-$47
+     * $42: command (0=status, 1=read, 2=write)
+     * $43: unit number
+     * $44-$45: buffer address (little-endian)
+     * $46-$47: block number (little-endian)
+     */
+    command = MemReadByte(0x42);
+    /* unit number at 0x43 is ignored for now */
+    bufferAddr = MemReadByte(0x44) | (MemReadByte(0x45) << 8);
+    blockNum = MemReadByte(0x46) | (MemReadByte(0x47) << 8);
+
+    /* Validate block number */
+    if (blockNum >= DiskBlockCount) {
+        Error("Block I/O: invalid block number %u (max %u)", blockNum, DiskBlockCount - 1);
+    }
+
+    blockOffset = blockNum * 512;
+
+    if (command == 1) {
+        /* Read block */
+        Print(stderr, 2, "Block I/O: READ block %u to $%04X\n", blockNum, bufferAddr);
+        for (i = 0; i < 512; i++) {
+            MemWriteByte(bufferAddr + i, DiskImage[blockOffset + i]);
+        }
+    } else if (command == 2) {
+        /* Write block */
+        Print(stderr, 2, "Block I/O: WRITE block %u from $%04X\n", blockNum, bufferAddr);
+        for (i = 0; i < 512; i++) {
+            DiskImage[blockOffset + i] = MemReadByte(bufferAddr + i);
+        }
+    } else {
+        /* Status or unknown command - ignore */
+        Print(stderr, 2, "Block I/O: command %u (ignored)\n", command);
+    }
+
+    /* Return with carry clear (success) */
+    /* This is handled automatically by the RTS at $C20A */
 }
 
 
@@ -345,6 +499,7 @@ int main (int argc, char* argv[])
         { "--help",             0,      OptHelp      },
         { "--cycles",           0,      OptCycles    },
         { "--cpu",              1,      OptCPU       },
+        { "--disk",             1,      OptDisk      },
         { "--trace",            0,      OptTrace     },
         { "--verbose",          0,      OptVerbose   },
         { "--version",          0,      OptVersion   },
@@ -384,6 +539,10 @@ int main (int argc, char* argv[])
 
                 case 'c':
                     OptCycles (Arg, 0);
+                    break;
+
+                case 'd':
+                    OptDisk (Arg, GetArg (&I, 2));
                     break;
 
                 case 'v':
@@ -426,6 +585,12 @@ int main (int argc, char* argv[])
      * This also sets the CPU type, unless a CPU override is in effect.
      */
     SPAddr = ReadProgramFile ();
+
+    /* Load disk image if specified */
+    LoadDiskImage ();
+
+    /* Install disk ROM if disk image was loaded */
+    InstallDiskROM ();
 
     /* Initialize the paravirtualization subsystem. It requires the stack pointer address, to be able to
      * simulate 6502 subroutine calls.
